@@ -27,6 +27,6 @@ message GenerateResponse {
   string token = 2;
   bool is_finished = 3;
   // Metrics reported back to the gateway for EWMA routing logic
-  int32 tokens_generated = 4; 
-  int32 processing_time_ms = 5; 
+  int32 tokens_generated = 4;
+  int32 processing_time_ms = 5;
 }
