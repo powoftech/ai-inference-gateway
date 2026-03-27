@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package inference.v1;
+
+option go_package = "github.com/powoftech/ai-inference-gateway/internal/gen/inference/v1;inferencev1";
+
+service ModelService {
+  // Server streaming RPC for token generation to simulate GPU output
+  rpc GenerateStream(GenerateRequest) returns (stream GenerateResponse) {}
+}
+
+message GenerateRequest {
+  string request_id = 1;
+  string model = 2;
+  repeated Message messages = 3;
+  // Metadata for tracing, routing, and quota enforcement
+  string tenant_id = 4;
+}
+
+message Message {
+  string role = 1;
+  string content = 2;
+}
+
+message GenerateResponse {
+  string request_id = 1;
+  string token = 2;
+  bool is_finished = 3;
+  // Metrics reported back to the gateway for EWMA routing logic
+  int32 tokens_generated = 4; 
+  int32 processing_time_ms = 5; 
+}
