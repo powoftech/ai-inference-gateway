@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"google.golang.org/grpc"
@@ -32,8 +33,8 @@ func (g *Gateway) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Retrieve values injected by middlewares
-	tenantID := r.Context().Value(middleware.TenantIDKey).(string)
-	tokenCount := r.Context().Value(middleware.TokenCountKey).(int)
+	tenantID, _ := r.Context().Value(middleware.TenantIDKey).(string)
+	tokenCount, _ := r.Context().Value(middleware.TokenCountKey).(int)
 
 	var reqBody InferRESTRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
@@ -104,7 +105,14 @@ func main() {
 	// 1. Initialize our singletons
 	middleware.InitTokenizer()
 
-	backendAddr := "localhost:9091"
+	// 2. Initialize Redis Sentinel client for rate limiting
+	middleware.InitRedisSentinel()
+
+	// Read Backend Address from ENV, fallback to localhost for native dev
+	backendAddr := os.Getenv("BACKEND_ADDR")
+	if backendAddr == "" {
+		backendAddr = "localhost:9091"
+	}
 	conn, err := grpc.NewClient(backendAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Did not connect to backend: %v", err)
@@ -115,14 +123,18 @@ func main() {
 		grpcClient: pb.NewInferenceServiceClient(conn),
 	}
 
-	// 2. Chain the middlewares: Auth -> Tokenizer -> handleStream
-	handler := middleware.AuthMiddleware(middleware.TokenEstimatorMiddleware(gateway.handleStream))
+	// 3. Chain the middlewares: Auth -> Tokenizer -> RateLimiter -> handleStream
+	handler := middleware.AuthMiddleware(
+		middleware.TokenEstimatorMiddleware(
+			middleware.RateLimitMiddleware(gateway.handleStream),
+		),
+	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/infer/stream", handler)
 
 	port := ":8080"
-	log.Printf("Gateway listening for HTTP/2 SSE on %s", port)
+	log.Printf("Gateway listening for HTTP/2 SSE on %s (Backend: %s)", port, backendAddr)
 	if err := http.ListenAndServe(port, mux); err != nil {
 		log.Fatalf("Failed to serve gateway: %v", err)
 	}

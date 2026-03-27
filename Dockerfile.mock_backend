@@ -1,0 +1,23 @@
+# Build stage
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+
+# Copy go mod and sum files
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the source code
+COPY . .
+
+# Build the mock backend binary
+RUN CGO_ENABLED=0 GOOS=linux go build -o /mock_backend cmd/mock_backend/main.go
+
+# Final stage
+FROM alpine:latest
+WORKDIR /
+COPY --from=builder /mock_backend /mock_backend
+
+# Expose gRPC port
+EXPOSE 9091 
+
+ENTRYPOINT ["/mock_backend"]

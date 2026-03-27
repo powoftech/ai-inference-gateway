@@ -20,8 +20,8 @@ var tke *tiktoken.Tiktoken
 // Initialize it once at startup
 func InitTokenizer() {
 	var err error
-	// cl100k_base is the standard encoding for OpenAI models, often used as a baseline for LLama/Mistral estimation
-	tke, err = tiktoken.GetEncoding("cl100k_base")
+	// o200k_base is the standard encoding for OpenAI models, often used as a baseline for LLama/Mistral estimation
+	tke, err = tiktoken.GetEncoding("o200k_base")
 	if err != nil {
 		log.Fatalf("Failed to initialize tiktoken: %v", err)
 	}
