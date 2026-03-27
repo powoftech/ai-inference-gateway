@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/powoftech/ai-inference-gateway/internal/middleware"
 	pb "github.com/powoftech/ai-inference-gateway/proto/inference/v2"
 )
 
@@ -29,6 +30,10 @@ func (g *Gateway) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Retrieve values injected by middlewares
+	tenantID := r.Context().Value(middleware.TenantIDKey).(string)
+	tokenCount := r.Context().Value(middleware.TokenCountKey).(int)
 
 	var reqBody InferRESTRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
@@ -60,7 +65,7 @@ func (g *Gateway) handleStream(w http.ResponseWriter, r *http.Request) {
 		Prompt:    reqBody.Prompt,
 	}
 
-	log.Printf("Forwarding request %s to backend...", reqID)
+	log.Printf("[Tenant: %s] Forwarding request %s (Estimated Tokens: %d) to backend...", tenantID, reqID, tokenCount)
 
 	// Call the gRPC backend
 	stream, err := g.grpcClient.InferStream(r.Context(), grpcReq)
@@ -96,9 +101,11 @@ func (g *Gateway) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Connect to the mock backend (hardcoded for Week 1)
+	// 1. Initialize our singletons
+	middleware.InitTokenizer()
+
 	backendAddr := "localhost:9091"
-	conn, err := grpc.Dial(backendAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(backendAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Did not connect to backend: %v", err)
 	}
@@ -108,8 +115,11 @@ func main() {
 		grpcClient: pb.NewInferenceServiceClient(conn),
 	}
 
+	// 2. Chain the middlewares: Auth -> Tokenizer -> handleStream
+	handler := middleware.AuthMiddleware(middleware.TokenEstimatorMiddleware(gateway.handleStream))
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/infer/stream", gateway.handleStream)
+	mux.HandleFunc("/v1/infer/stream", handler)
 
 	port := ":8080"
 	log.Printf("Gateway listening for HTTP/2 SSE on %s", port)
