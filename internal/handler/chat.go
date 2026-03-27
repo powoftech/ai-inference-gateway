@@ -10,16 +10,21 @@ import (
 	"time"
 
 	pb "github.com/powoftech/ai-inference-gateway/internal/gen/inference/v1"
+	"github.com/powoftech/ai-inference-gateway/internal/rate_limit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 type ChatHandler struct {
 	ModelClient pb.ModelServiceClient
+	Limiter     *rate_limit.TwoTierLimiter // Inject Limiter
 }
 
-func NewChatHandler(client pb.ModelServiceClient) *ChatHandler {
-	return &ChatHandler{ModelClient: client}
+func NewChatHandler(client pb.ModelServiceClient, limiter *rate_limit.TwoTierLimiter) *ChatHandler {
+	return &ChatHandler{
+		ModelClient: client,
+		Limiter:     limiter,
+	}
 }
 
 func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -30,15 +35,38 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 
 	var req ChatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Bad request: invalid JSON payload", http.StatusBadRequest)
+		http.Error(w, "Bad request: invalid payload", http.StatusBadRequest)
 		return
 	}
 
-	// 1. Setup Server-Sent Events (SSE) Headers
+	// --- NEW: RATE LIMITING PHASE ---
+	tenantID := "demo-tenant" // Typically extracted from Authorization Header
+
+	// 1. Estimate prompt tokens
+	promptContent := ""
+	if len(req.Messages) > 0 {
+		promptContent = req.Messages[0].Content
+	}
+	estimatedTokens := rate_limit.EstimateTokens(promptContent)
+
+	// 2. Add an arbitrary buffer for the generated output (e.g., we assume they will generate at least 20 tokens)
+	totalRequestedTokens := estimatedTokens + 20
+
+	// 3. Deduct from local Tier 1 memory. This takes < 1ms.
+	if err := h.Limiter.Deduct(r.Context(), tenantID, totalRequestedTokens); err != nil {
+		if errors.Is(err, rate_limit.ErrQuotaExceeded) {
+			log.Printf("Tenant %s rate limited. Tokens requested: %d", tenantID, totalRequestedTokens)
+			http.Error(w, "429 Too Many Requests: Token Quota Exceeded", http.StatusTooManyRequests)
+			return
+		}
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	// --------------------------------
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	// Allow CORS for easy testing from frontend clients
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	flusher, ok := w.(http.Flusher)
@@ -47,7 +75,6 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// 2. Map HTTP request to gRPC contract
 	var grpcMessages []*pb.Message
 	for _, m := range req.Messages {
 		grpcMessages = append(grpcMessages, &pb.Message{
@@ -60,53 +87,38 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 		RequestId: fmt.Sprintf("req-%d", time.Now().UnixNano()),
 		Model:     req.Model,
 		Messages:  grpcMessages,
-		TenantId:  "demo-tenant", // Hardcoded for Phase 2; Phase 3 will pull from API keys
+		TenantId:  tenantID,
 	}
 
-	// 3. Initiate gRPC Stream with Context Propagation (Milestone 5)
-	// Notice we pass `r.Context()`. If the HTTP client drops, this context is canceled,
-	// immediately closing the gRPC stream to the backend.
 	stream, err := h.ModelClient.GenerateStream(r.Context(), grpcReq)
 	if err != nil {
-		log.Printf("Failed to call backend: %v", err)
 		http.Error(w, "Backend unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	// 4. Multiplex gRPC stream to HTTP SSE
 	for {
 		resp, err := stream.Recv()
 
 		if errors.Is(err, io.EOF) {
-			// Backend finished sending tokens
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			return
 		}
 
 		if err != nil {
-			// Handle client disconnects gracefully without throwing massive errors
 			if status.Code(err) == codes.Canceled {
-				log.Printf("Client disconnected, canceling backend generation for request: %s", grpcReq.RequestId)
 				return
 			}
-			log.Printf("Error receiving from stream: %v", err)
 			return
 		}
 
-		// Map backend response to OpenAI format
 		chunk := ChatCompletionChunk{
 			ID:      resp.RequestId,
 			Object:  "chat.completion.chunk",
 			Created: time.Now().Unix(),
 			Model:   req.Model,
 			Choices: []Choice{
-				{
-					Index: 0,
-					Delta: Delta{
-						Content: resp.Token,
-					},
-				},
+				{Index: 0, Delta: Delta{Content: resp.Token}},
 			},
 		}
 
@@ -116,9 +128,7 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 		}
 
 		chunkBytes, _ := json.Marshal(chunk)
-
-		// Write standard SSE payload
 		fmt.Fprintf(w, "data: %s\n\n", string(chunkBytes))
-		flusher.Flush() // Force the buffer to flush down to the client immediately
+		flusher.Flush()
 	}
 }
