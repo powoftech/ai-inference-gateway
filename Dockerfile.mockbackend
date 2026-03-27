@@ -10,14 +10,14 @@ RUN go mod download
 COPY . .
 
 # Build the mock backend binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o /mock_backend cmd/mock_backend/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o /mockbackend cmd/mockbackend/main.go
 
 # Final stage
 FROM alpine:latest
 WORKDIR /
-COPY --from=builder /mock_backend /mock_backend
+COPY --from=builder /mockbackend /mockbackend
 
 # Expose gRPC port
 EXPOSE 9091 
 
-ENTRYPOINT ["/mock_backend"]
+ENTRYPOINT ["/mockbackend"]

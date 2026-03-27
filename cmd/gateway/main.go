@@ -7,17 +7,19 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/powoftech/ai-inference-gateway/internal/middleware"
+	"github.com/powoftech/ai-inference-gateway/internal/routing"
 	pb "github.com/powoftech/ai-inference-gateway/proto/inference/v2"
 )
 
 type Gateway struct {
-	grpcClient pb.InferenceServiceClient
+	lb *routing.LoadBalancer
 }
 
 // REST Request payload
@@ -42,15 +44,10 @@ func (g *Gateway) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a mock Request ID (in the real app, we'll use a middleware UUID)
-	reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
-
 	// Set necessary headers for Server-Sent Events (SSE)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	// Allow cross-origin for easy testing
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	// Ensure the connection supports flushing
 	flusher, ok := w.(http.Flusher)
@@ -59,19 +56,33 @@ func (g *Gateway) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prepare gRPC Request
+	// Select the best backend using Load Balancer
+	backend, err := g.lb.SelectWeightedBackend()
+	if err != nil {
+		http.Error(w, "Service Unavailable: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	log.Printf("[Tenant: %s] Routing to Backend: %s (Estimated Tokens: %d)", tenantID, backend.ID, tokenCount)
+
+	// Generate a mock Request ID (in the real app, we'll use a middleware UUID)
+	reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
+
 	grpcReq := &pb.InferRequest{
 		RequestId: reqID,
 		ModelId:   reqBody.ModelID,
 		Prompt:    reqBody.Prompt,
 	}
 
-	log.Printf("[Tenant: %s] Forwarding request %s (Estimated Tokens: %d) to backend...", tenantID, reqID, tokenCount)
+	grpcClient := pb.NewInferenceServiceClient(backend.Client)
 
-	// Call the gRPC backend
-	stream, err := g.grpcClient.InferStream(r.Context(), grpcReq)
+	start := time.Now()
+	stream, err := grpcClient.InferStream(r.Context(), grpcReq)
 	if err != nil {
-		log.Printf("Failed to call backend: %v", err)
+		// CIRCUIT BREAKER: RECORD FAILURE
+		log.Printf("Backend %s failed: %v", backend.ID, err)
+		backend.RecordFailure()
+		http.Error(w, "Backend stream failed", http.StatusBadGateway)
 		return
 	}
 
@@ -82,48 +93,54 @@ func (g *Gateway) handleStream(w http.ResponseWriter, r *http.Request) {
 			break // Backend stream is finished
 		}
 		if err != nil {
-			log.Printf("Error reading from stream: %v", err)
+			log.Printf("Backend %s read error: %v", backend.ID, err)
+			backend.RecordFailure()
 			return
 		}
 
 		// Serialize the chunk to JSON
 		jsonChunk, err := json.Marshal(chunk)
 		if err != nil {
-			log.Printf("JSON serialization error: %v", err)
-			continue
+			log.Printf("JSON marshaling error: %v", err)
+			backend.RecordFailure()
+			return
 		}
-
 		// Write in SSE format: data: {...}\n\n
 		fmt.Fprintf(w, "data: %s\n\n", jsonChunk)
-		flusher.Flush() // Crucial: Immediately push the buffer to the client
+		flusher.Flush()
 	}
 
-	log.Printf("Completed streaming request %s", reqID)
+	duration := time.Since(start)
+	backend.RecordSuccess()
+	backend.UpdateLatency(duration)
+
+	log.Printf("Finished request on %s in %v. New EWMA: %.2fms", backend.ID, duration, backend.GetWeight())
 }
 
 func main() {
-	// 1. Initialize our singletons
 	middleware.InitTokenizer()
-
-	// 2. Initialize Redis Sentinel client for rate limiting
 	middleware.InitRedisSentinel()
 
-	// Read Backend Address from ENV, fallback to localhost for native dev
-	backendAddr := os.Getenv("BACKEND_ADDR")
-	if backendAddr == "" {
-		backendAddr = "localhost:9091"
-	}
-	conn, err := grpc.NewClient(backendAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("Did not connect to backend: %v", err)
-	}
-	defer conn.Close()
-
-	gateway := &Gateway{
-		grpcClient: pb.NewInferenceServiceClient(conn),
+	backendAddrsStr := os.Getenv("BACKEND_ADDRS")
+	if backendAddrsStr == "" {
+		backendAddrsStr = "localhost:9091"
 	}
 
-	// 3. Chain the middlewares: Auth -> Tokenizer -> RateLimiter -> handleStream
+	lb := routing.NewLoadBalancer()
+
+	// Parse comma-separated backends and add them to the Load Balancer
+	addrs := strings.Split(backendAddrsStr, ",")
+	for i, addr := range addrs {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Fatalf("Failed to connect to backend %s: %v", addr, err)
+		}
+		backendID := fmt.Sprintf("backend-%d", i+1)
+		lb.AddBackend(routing.NewBackend(backendID, addr, conn))
+		log.Printf("Registered %s at %s (with active health checking)", backendID, addr)
+	}
+
+	gateway := &Gateway{lb: lb}
 	handler := middleware.AuthMiddleware(
 		middleware.TokenEstimatorMiddleware(
 			middleware.RateLimitMiddleware(gateway.handleStream),
@@ -134,7 +151,7 @@ func main() {
 	mux.HandleFunc("/v1/infer/stream", handler)
 
 	port := ":8080"
-	log.Printf("Gateway listening for HTTP/2 SSE on %s (Backend: %s)", port, backendAddr)
+	log.Printf("Gateway listening on %s", port)
 	if err := http.ListenAndServe(port, mux); err != nil {
 		log.Fatalf("Failed to serve gateway: %v", err)
 	}
