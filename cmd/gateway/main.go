@@ -7,6 +7,7 @@ import (
 	pb "github.com/powoftech/ai-inference-gateway/internal/gen/inference/v1"
 	"github.com/powoftech/ai-inference-gateway/internal/handler"
 	"github.com/powoftech/ai-inference-gateway/internal/rate_limit"
+	"github.com/powoftech/ai-inference-gateway/internal/telemetry"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -26,10 +27,16 @@ func main() {
 	// Initialize the new Rate Limiter with a local Redis connection
 	limiter := rate_limit.NewTwoTierLimiter("localhost:6379")
 
+	// Initialize Telemetry
+	telemetry.InitMetrics()
+
 	// Inject the limiter into the handler
 	chatHandler := handler.NewChatHandler(modelClient, limiter)
 
 	http.HandleFunc("/v1/chat/completions", chatHandler.HandleChatCompletions)
+
+	// Expose Prometheus metrics endpoint
+	http.Handle("/metrics", telemetry.MetricsHandler())
 
 	port := ":8080"
 	log.Printf("Go Gateway (Rate Limited) listening on %s...", port)

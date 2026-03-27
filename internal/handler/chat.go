@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/powoftech/ai-inference-gateway/internal/gen/inference/v1"
 	"github.com/powoftech/ai-inference-gateway/internal/rate_limit"
+	"github.com/powoftech/ai-inference-gateway/internal/telemetry"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -64,6 +65,10 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 	// --------------------------------
 
+	// Increment active requests. Decrement automatically when the function exits.
+	telemetry.ActiveRequests.Inc()
+	defer telemetry.ActiveRequests.Dec()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -96,6 +101,9 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	startTime := time.Now()
+	firstTokenReceived := false
+
 	for {
 		resp, err := stream.Recv()
 
@@ -112,6 +120,14 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
+		// Track TTFT the exact moment the first payload arrives from the gRPC stream
+		if !firstTokenReceived {
+			firstTokenReceived = true
+			telemetry.TTFTLatency.WithLabelValues(req.Model).Observe(float64(time.Since(startTime).Milliseconds()))
+		}
+
+		telemetry.TokensGenerated.WithLabelValues(req.Model).Inc()
+
 		chunk := ChatCompletionChunk{
 			ID:      resp.RequestId,
 			Object:  "chat.completion.chunk",
@@ -125,6 +141,9 @@ func (h *ChatHandler) HandleChatCompletions(w http.ResponseWriter, r *http.Reque
 		if resp.IsFinished {
 			finishReason := "stop"
 			chunk.Choices[0].FinishReason = &finishReason
+
+			// Record total generation time
+			telemetry.TotalLatency.WithLabelValues(req.Model).Observe(float64(time.Since(startTime).Milliseconds()))
 		}
 
 		chunkBytes, _ := json.Marshal(chunk)
