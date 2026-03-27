@@ -3,8 +3,12 @@ package rate_limit
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
+
+	"github.com/pkoukk/tiktoken-go"
+	"github.com/redis/go-redis/v9"
 )
 
 // ErrQuotaExceeded is returned when a tenant has no tokens left
@@ -15,6 +19,8 @@ var ErrQuotaExceeded = errors.New("quota exceeded")
 type TenantQuota struct {
 	mu              sync.Mutex
 	TokensRemaining int
+	// Track tokens consumed locally since the last Redis sync
+	pendingSync int
 	// In a real system, we track when the quota resets (e.g., next minute)
 	ResetAt time.Time
 }
@@ -24,12 +30,18 @@ type TwoTierLimiter struct {
 	// Tier 1: Local Memory. sync.Map provides highly concurrent lock-free reads
 	localCache sync.Map
 
-	// Tier 2: Redis Client would go here (omitted for local testing setup)
-	// redisClient *redis.Client
+	// Tier 2: Redis Client for eventual consistency across distributed pods
+	redisClient *redis.Client
 }
 
-func NewTwoTierLimiter() *TwoTierLimiter {
-	limiter := &TwoTierLimiter{}
+func NewTwoTierLimiter(redisAddr string) *TwoTierLimiter {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+
+	limiter := &TwoTierLimiter{
+		redisClient: rdb,
+	}
 
 	// Seed our mock tenant for Phase 3 testing
 	limiter.localCache.Store("demo-tenant", &TenantQuota{
@@ -37,8 +49,8 @@ func NewTwoTierLimiter() *TwoTierLimiter {
 		ResetAt:         time.Now().Add(1 * time.Hour),
 	})
 
-	// In production, start a background goroutine here to sync to Redis periodically
-	// go limiter.asyncRedisSync()
+	// Start the background synchronization goroutine
+	go limiter.asyncRedisSync()
 
 	return limiter
 }
@@ -62,16 +74,61 @@ func (l *TwoTierLimiter) Deduct(ctx context.Context, tenantID string, tokens int
 	}
 
 	quota.TokensRemaining -= tokens
+	quota.pendingSync += tokens // Track for the async worker
 	return nil
 }
 
-// EstimateTokens is a highly simplified token estimator.
-// In Milestone 6, you will replace this with the 'tiktoken-go' library.
+// EstimateTokens uses standard BPE tokenization instead of heuristics.
+// In Phase 3, we replace the dummy logic with 'tiktoken-go'.
 func EstimateTokens(prompt string) int {
-	// Rough heuristic: 1 word ≈ 1.3 tokens
-	words := len(prompt) / 5
-	if words == 0 {
-		return 1
+	// Note: For optimal performance in production, 'tkm' should be instantiated
+	// once globally or pooled, rather than per-request. We scope it here for this milestone.
+	tkm, err := tiktoken.GetEncoding("o200k_base")
+	if err != nil {
+		log.Printf("Tokenizer err: %v, falling back to heuristic", err)
+		words := len(prompt) / 5
+		if words == 0 {
+			return 1
+		}
+		return words
 	}
-	return words
+
+	token := tkm.Encode(prompt, nil, nil)
+	return len(token)
+}
+
+// asyncRedisSync runs in the background, flushing local consumption to the global Redis cluster.
+func (l *TwoTierLimiter) asyncRedisSync() {
+	// As per your Technical Spec, this is the "Eventual Consistency" window
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	ctx := context.Background()
+
+	for range ticker.C {
+		l.localCache.Range(func(key, value interface{}) bool {
+			tenantID := key.(string)
+			quota := value.(*TenantQuota)
+
+			quota.mu.Lock()
+			consumed := quota.pendingSync
+			quota.pendingSync = 0 // Reset local counter
+			quota.mu.Unlock()
+
+			if consumed > 0 {
+				// Decrement global Redis state
+				err := l.redisClient.DecrBy(ctx, "quota:"+tenantID, int64(consumed)).Err()
+				if err != nil {
+					log.Printf("Failed to sync tenant %s to Redis: %v", tenantID, err)
+					// Revert the pending tokens so we try again next tick
+					quota.mu.Lock()
+					quota.pendingSync += consumed
+					quota.mu.Unlock()
+				} else {
+					log.Printf("Background Sync: Deducted %d tokens from Redis for %s", consumed, tenantID)
+				}
+			}
+			return true
+		})
+	}
 }

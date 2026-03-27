@@ -23,8 +23,8 @@ func main() {
 
 	modelClient := pb.NewModelServiceClient(conn)
 
-	// Initialize the new Rate Limiter
-	limiter := rate_limit.NewTwoTierLimiter()
+	// Initialize the new Rate Limiter with a local Redis connection
+	limiter := rate_limit.NewTwoTierLimiter("localhost:6379")
 
 	// Inject the limiter into the handler
 	chatHandler := handler.NewChatHandler(modelClient, limiter)
