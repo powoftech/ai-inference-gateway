@@ -153,7 +153,7 @@ func (b *Backend) performHealthCheck() {
 
 	// Check gRPC connection state
 	state := b.conn.GetState()
-	
+
 	// Try to transition to READY state if not already
 	if state != connectivity.Ready {
 		// Wait for state change or timeout
