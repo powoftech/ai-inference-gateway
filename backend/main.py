@@ -1,5 +1,8 @@
+import os
+import sys
 import time
 from concurrent import futures
+from collections.abc import Generator
 
 import grpc
 
@@ -9,14 +12,18 @@ import inference_pb2_grpc
 
 
 class ModelService(inference_pb2_grpc.ModelServiceServicer):
-    def GenerateStream(self, request, context):
+    def GenerateStream(
+        self,
+        request,
+        context,
+    ) -> Generator[inference_pb2.GenerateResponse, None, None]:
         """
         Simulates an LLM backend generating tokens via server streaming.
         """
         # 1. Simulate TTFT (Time To First Token) - GPU loading into VRAM
         time.sleep(0.100)  # 100ms sleep
 
-        mock_text: str = "Hello, this is a mock response from the GreenNode AI cluster."
+        mock_text = "Hello, this is a mock response from the GreenNode AI cluster."
         words = mock_text.split(" ")
 
         start_time = time.time()
@@ -48,9 +55,16 @@ def serve():
     server: grpc.Server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     inference_pb2_grpc.add_ModelServiceServicer_to_server(ModelService(), server)
 
-    port = "[::]:50051"
-    server.add_insecure_port(port)
-    print(f"Mock Python Backend listening securely on {port}...")
+    # 12-Factor App: Resolve port via CLI argument, Environment Variable, or Default
+    port = "50051"
+    if len(sys.argv) > 1:
+        port = sys.argv[1]
+    elif os.environ.get("PORT"):
+        port = os.environ.get("PORT")
+
+    address = f"[::]:{port}"
+    server.add_insecure_port(address)
+    print(f"Mock Python Backend listening securely on {address}...")
 
     server.start()
     server.wait_for_termination()

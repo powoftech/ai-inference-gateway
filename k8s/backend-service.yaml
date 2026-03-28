@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  replicas: 3 # We start with 3 simulated GPUs to test load balancing
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: backend:latest
+          imagePullPolicy: Never # Use local image for Minikube
+          ports:
+            - containerPort: 50051
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "1"
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+---
+# HEADLESS SERVICE: Critical for gRPC Client-Side Load Balancing
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  clusterIP: None # This makes it headless
+  selector:
+    app: backend
+  ports:
+    - protocol: TCP
+      port: 50051
+      targetPort: 50051

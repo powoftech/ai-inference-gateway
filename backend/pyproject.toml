@@ -5,8 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "fastapi[standard-no-fastapi-cloud-cli]>=0.135.2",
+    # "fastapi[standard-no-fastapi-cloud-cli]>=0.135.2",
+    # "orjson>=3.11.7",
     "grpcio>=1.78.0",
     "grpcio-tools>=1.78.0",
-    "orjson>=3.11.7",
 ]
